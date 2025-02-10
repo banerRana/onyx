@@ -15,10 +15,15 @@ from onyx.background.celery.celery_utils import get_deletion_attempt_snapshot
 from onyx.background.celery.tasks.doc_permission_syncing.tasks import (
     try_creating_permissions_sync_task,
 )
+from onyx.background.celery.tasks.external_group_syncing.tasks import (
+    try_creating_external_group_sync_task,
+)
 from onyx.background.celery.tasks.pruning.tasks import (
     try_creating_prune_generator_task,
 )
 from onyx.background.celery.versioned_apps.primary import app as primary_app
+from onyx.configs.constants import OnyxCeleryPriority
+from onyx.configs.constants import OnyxCeleryTask
 from onyx.db.connector_credential_pair import add_credential_to_connector
 from onyx.db.connector_credential_pair import (
     get_connector_credential_pair_from_id_for_user,
@@ -39,7 +44,7 @@ from onyx.db.index_attempt import get_latest_index_attempt_for_cc_pair_id
 from onyx.db.index_attempt import get_paginated_index_attempts_for_cc_pair_id
 from onyx.db.models import SearchSettings
 from onyx.db.models import User
-from onyx.db.search_settings import get_active_search_settings
+from onyx.db.search_settings import get_active_search_settings_list
 from onyx.db.search_settings import get_current_search_settings
 from onyx.redis.redis_connector import RedisConnector
 from onyx.redis.redis_pool import get_redis_client
@@ -189,7 +194,7 @@ def update_cc_pair_status(
     if status_update_request.status == ConnectorCredentialPairStatus.PAUSED:
         redis_connector.stop.set_fence(True)
 
-        search_settings_list: list[SearchSettings] = get_active_search_settings(
+        search_settings_list: list[SearchSettings] = get_active_search_settings_list(
             db_session
         )
 
@@ -224,6 +229,13 @@ def update_cc_pair_status(
     )
 
     db_session.commit()
+
+    # this speeds up the start of indexing by firing the check immediately
+    primary_app.send_task(
+        OnyxCeleryTask.CHECK_FOR_INDEXING,
+        kwargs=dict(tenant_id=tenant_id),
+        priority=OnyxCeleryPriority.HIGH,
+    )
 
     return JSONResponse(
         status_code=HTTPStatus.OK, content={"message": str(HTTPStatus.OK)}
@@ -356,14 +368,16 @@ def prune_cc_pair(
         f"credential={cc_pair.credential_id} "
         f"{cc_pair.connector.name} connector."
     )
-    tasks_created = try_creating_prune_generator_task(
+    payload_id = try_creating_prune_generator_task(
         primary_app, cc_pair, db_session, r, CURRENT_TENANT_ID_CONTEXTVAR.get()
     )
-    if not tasks_created:
+    if not payload_id:
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             detail="Pruning task creation failed.",
         )
+
+    logger.info(f"Pruning queued: cc_pair={cc_pair.id} id={payload_id}")
 
     return StatusResponse(
         success=True,
@@ -419,27 +433,103 @@ def sync_cc_pair(
     if redis_connector.permissions.fenced:
         raise HTTPException(
             status_code=HTTPStatus.CONFLICT,
-            detail="Doc permissions sync task already in progress.",
+            detail="Permissions sync task already in progress.",
         )
 
     logger.info(
-        f"Doc permissions sync cc_pair={cc_pair_id} "
+        f"Permissions sync cc_pair={cc_pair_id} "
         f"connector_id={cc_pair.connector_id} "
         f"credential_id={cc_pair.credential_id} "
         f"{cc_pair.connector.name} connector."
     )
-    tasks_created = try_creating_permissions_sync_task(
+    payload_id = try_creating_permissions_sync_task(
         primary_app, cc_pair_id, r, CURRENT_TENANT_ID_CONTEXTVAR.get()
     )
-    if not tasks_created:
+    if not payload_id:
         raise HTTPException(
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-            detail="Doc permissions sync task creation failed.",
+            detail="Permissions sync task creation failed.",
         )
+
+    logger.info(f"Permissions sync queued: cc_pair={cc_pair_id} id={payload_id}")
 
     return StatusResponse(
         success=True,
-        message="Successfully created the doc permissions sync task.",
+        message="Successfully created the permissions sync task.",
+    )
+
+
+@router.get("/admin/cc-pair/{cc_pair_id}/sync-groups")
+def get_cc_pair_latest_group_sync(
+    cc_pair_id: int,
+    user: User = Depends(current_curator_or_admin_user),
+    db_session: Session = Depends(get_session),
+) -> datetime | None:
+    cc_pair = get_connector_credential_pair_from_id_for_user(
+        cc_pair_id=cc_pair_id,
+        db_session=db_session,
+        user=user,
+        get_editable=False,
+    )
+    if not cc_pair:
+        raise HTTPException(
+            status_code=400,
+            detail="cc_pair not found for current user's permissions",
+        )
+
+    return cc_pair.last_time_external_group_sync
+
+
+@router.post("/admin/cc-pair/{cc_pair_id}/sync-groups")
+def sync_cc_pair_groups(
+    cc_pair_id: int,
+    user: User = Depends(current_curator_or_admin_user),
+    db_session: Session = Depends(get_session),
+    tenant_id: str | None = Depends(get_current_tenant_id),
+) -> StatusResponse[list[int]]:
+    """Triggers group sync on a particular cc_pair immediately"""
+
+    cc_pair = get_connector_credential_pair_from_id_for_user(
+        cc_pair_id=cc_pair_id,
+        db_session=db_session,
+        user=user,
+        get_editable=False,
+    )
+    if not cc_pair:
+        raise HTTPException(
+            status_code=400,
+            detail="Connection not found for current user's permissions",
+        )
+
+    r = get_redis_client(tenant_id=tenant_id)
+
+    redis_connector = RedisConnector(tenant_id, cc_pair_id)
+    if redis_connector.external_group_sync.fenced:
+        raise HTTPException(
+            status_code=HTTPStatus.CONFLICT,
+            detail="External group sync task already in progress.",
+        )
+
+    logger.info(
+        f"External group sync cc_pair={cc_pair_id} "
+        f"connector_id={cc_pair.connector_id} "
+        f"credential_id={cc_pair.credential_id} "
+        f"{cc_pair.connector.name} connector."
+    )
+    payload_id = try_creating_external_group_sync_task(
+        primary_app, cc_pair_id, r, CURRENT_TENANT_ID_CONTEXTVAR.get()
+    )
+    if not payload_id:
+        raise HTTPException(
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            detail="External group sync task creation failed.",
+        )
+
+    logger.info(f"External group sync queued: cc_pair={cc_pair_id} id={payload_id}")
+
+    return StatusResponse(
+        success=True,
+        message="Successfully created the external group sync task.",
     )
 
 
@@ -463,7 +553,14 @@ def associate_credential_to_connector(
     metadata: ConnectorCredentialPairMetadata,
     user: User | None = Depends(current_curator_or_admin_user),
     db_session: Session = Depends(get_session),
+    tenant_id: str = Depends(get_current_tenant_id),
 ) -> StatusResponse[int]:
+    """NOTE(rkuo): internally discussed and the consensus is this endpoint
+    and create_connector_with_mock_credential should be combined.
+
+    The intent of this endpoint is to handle connectors that actually need credentials.
+    """
+
     fetch_ee_implementation_or_noop(
         "onyx.db.user_group", "validate_object_creation_for_user", None
     )(
@@ -484,6 +581,18 @@ def associate_credential_to_connector(
             access_type=metadata.access_type,
             auto_sync_options=metadata.auto_sync_options,
             groups=metadata.groups,
+        )
+
+        # trigger indexing immediately
+        primary_app.send_task(
+            OnyxCeleryTask.CHECK_FOR_INDEXING,
+            priority=OnyxCeleryPriority.HIGH,
+            kwargs={"tenant_id": tenant_id},
+        )
+
+        logger.info(
+            f"associate_credential_to_connector - running check_for_indexing: "
+            f"cc_pair={response.data}"
         )
 
         return response

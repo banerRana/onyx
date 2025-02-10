@@ -18,6 +18,7 @@ from onyx.db.engine import get_session_with_tenant
 from onyx.db.engine import SYNC_DB_API
 from onyx.db.search_settings import get_current_search_settings
 from onyx.db.swap_index import check_index_swap
+from onyx.document_index.document_index_utils import get_multipass_config
 from onyx.document_index.vespa.index import DOCUMENT_ID_ENDPOINT
 from onyx.document_index.vespa.index import VespaIndex
 from onyx.indexing.models import IndexingSetting
@@ -173,10 +174,16 @@ def reset_vespa() -> None:
         check_index_swap(db_session)
 
         search_settings = get_current_search_settings(db_session)
+        multipass_config = get_multipass_config(search_settings)
         index_name = search_settings.index_name
 
     success = setup_vespa(
-        document_index=VespaIndex(index_name=index_name, secondary_index_name=None),
+        document_index=VespaIndex(
+            index_name=index_name,
+            secondary_index_name=None,
+            large_chunks_enabled=multipass_config.enable_large_chunks,
+            secondary_large_chunks_enabled=None,
+        ),
         index_setting=IndexingSetting.from_db_model(search_settings),
         secondary_index_setting=None,
     )
@@ -235,6 +242,18 @@ def reset_postgres_multitenant() -> None:
         schema_name = schema[0]
         cur.execute(f'DROP SCHEMA "{schema_name}" CASCADE')
 
+    # Drop tables in the public schema
+    cur.execute(
+        """
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = 'public'
+        """
+    )
+    public_tables = cur.fetchall()
+    for table in public_tables:
+        table_name = table[0]
+        cur.execute(f'DROP TABLE IF EXISTS public."{table_name}" CASCADE')
+
     cur.close()
     conn.close()
 
@@ -250,10 +269,16 @@ def reset_vespa_multitenant() -> None:
             check_index_swap(db_session)
 
             search_settings = get_current_search_settings(db_session)
+            multipass_config = get_multipass_config(search_settings)
             index_name = search_settings.index_name
 
         success = setup_vespa(
-            document_index=VespaIndex(index_name=index_name, secondary_index_name=None),
+            document_index=VespaIndex(
+                index_name=index_name,
+                secondary_index_name=None,
+                large_chunks_enabled=multipass_config.enable_large_chunks,
+                secondary_large_chunks_enabled=None,
+            ),
             index_setting=IndexingSetting.from_db_model(search_settings),
             secondary_index_setting=None,
         )

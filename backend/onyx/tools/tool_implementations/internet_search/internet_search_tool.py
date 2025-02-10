@@ -218,7 +218,17 @@ class InternetSearchTool(Tool):
             headers=self.headers,
             params={"q": query, "count": self.num_results},
         )
+
+        response.raise_for_status()
+
         results = response.json()
+
+        # If no hits, Bing does not include the webPages key
+        search_results = (
+            results["webPages"]["value"][: self.num_results]
+            if "webPages" in results
+            else []
+        )
 
         return InternetSearchResponse(
             revised_query=query,
@@ -228,7 +238,7 @@ class InternetSearchTool(Tool):
                     link=result["url"],
                     snippet=result["snippet"],
                 )
-                for result in results["webPages"]["value"][: self.num_results]
+                for result in search_results
             ],
         )
 
@@ -269,4 +279,5 @@ class InternetSearchTool(Tool):
             using_tool_calling_llm=using_tool_calling_llm,
             answer_style_config=self.answer_style_config,
             prompt_config=self.prompt_config,
+            context_type="internet search results",
         )

@@ -9,8 +9,10 @@ founders@onyx.app for more information. Please visit https://github.com/onyx-dot
 
 # Default ONYX_VERSION, typically overriden during builds by GitHub Actions.
 ARG ONYX_VERSION=0.8-dev
+# DO_NOT_TRACK is used to disable telemetry for Unstructured
 ENV ONYX_VERSION=${ONYX_VERSION} \
-    DANSWER_RUNNING_IN_DOCKER="true"
+    DANSWER_RUNNING_IN_DOCKER="true" \
+    DO_NOT_TRACK="true"
 
 
 RUN echo "ONYX_VERSION: ${ONYX_VERSION}"
@@ -99,7 +101,8 @@ COPY ./alembic_tenants /app/alembic_tenants
 COPY ./alembic.ini /app/alembic.ini
 COPY supervisord.conf /usr/etc/supervisord.conf
 
-# Escape hatch
+# Escape hatch scripts
+COPY ./scripts/debugging /app/scripts/debugging
 COPY ./scripts/force_delete_connector_by_id.py /app/scripts/force_delete_connector_by_id.py
 
 # Put logo in assets
