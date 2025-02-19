@@ -42,6 +42,7 @@ from onyx.connectors.interfaces import LoadConnector
 from onyx.connectors.interfaces import PollConnector
 from onyx.connectors.interfaces import SecondsSinceUnixEpoch
 from onyx.connectors.interfaces import SlimConnector
+from onyx.indexing.indexing_heartbeat import IndexingHeartbeatInterface
 from onyx.utils.logger import setup_logger
 from onyx.utils.retry_wrapper import retry_builder
 
@@ -301,7 +302,7 @@ class GoogleDriveConnector(LoadConnector, PollConnector, SlimConnector):
             if e.status_code == 401:
                 # fail gracefully, let the other impersonations continue
                 # one user without access shouldn't block the entire connector
-                logger.exception(
+                logger.warning(
                     f"User '{user_email}' does not have access to the drive APIs."
                 )
                 return
@@ -564,6 +565,7 @@ class GoogleDriveConnector(LoadConnector, PollConnector, SlimConnector):
         self,
         start: SecondsSinceUnixEpoch | None = None,
         end: SecondsSinceUnixEpoch | None = None,
+        callback: IndexingHeartbeatInterface | None = None,
     ) -> GenerateSlimDocumentOutput:
         slim_batch = []
         for file in self._fetch_drive_items(
@@ -576,15 +578,26 @@ class GoogleDriveConnector(LoadConnector, PollConnector, SlimConnector):
             if len(slim_batch) >= SLIM_BATCH_SIZE:
                 yield slim_batch
                 slim_batch = []
+                if callback:
+                    if callback.should_stop():
+                        raise RuntimeError(
+                            "_extract_slim_docs_from_google_drive: Stop signal detected"
+                        )
+
+                    callback.progress("_extract_slim_docs_from_google_drive", 1)
+
         yield slim_batch
 
     def retrieve_all_slim_documents(
         self,
         start: SecondsSinceUnixEpoch | None = None,
         end: SecondsSinceUnixEpoch | None = None,
+        callback: IndexingHeartbeatInterface | None = None,
     ) -> GenerateSlimDocumentOutput:
         try:
-            yield from self._extract_slim_docs_from_google_drive(start, end)
+            yield from self._extract_slim_docs_from_google_drive(
+                start, end, callback=callback
+            )
         except Exception as e:
             if MISSING_SCOPES_ERROR_STR in str(e):
                 raise PermissionError(ONYX_SCOPE_INSTRUCTIONS) from e
